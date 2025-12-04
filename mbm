@@ -28,12 +28,15 @@ zmodload -F zsh/files +b:rm +b:mkdir
 # Set BKT_CACHE_DIR so we won't save bkt outputs to TMPDIR after we override it.
 export BKT_CACHE_DIR="${BKT_CACHE_DIR:-${BKT_TMPDIR:-${TMPDIR:-/tmp}}}"
 export TMPDIR="$(mktemp --tmpdir -d "$PROGNAME".XXXXXXX)"
-function cleanup { set -x; rm -rf -- "$TMPDIR" }
-zshexit+=( cleanup )
-() {
-  local sig
-  for sig ("$@") trap "set -x; cleanup; kill -s $1 \$\$" "$1"
-} HUP TERM INT USR1
+function cleanup { rm -rf -- "$TMPDIR" }
+zshexit_functions+=( cleanup )
+function handle_sig {
+  local sig="$1"
+  cleanup
+  trap - $sig
+  kill -s $sig $$
+}
+for sig (HUP TERM INT USR1) trap "handle_sig $sig" "$sig"
 
 if [[ ! -v BKT_TTL || ! $+commands[bkt] ]]; then
   echo "Install https://github.com/dimo414/bkt and set BKT_TTL for cache-rerun speedup" >&2
