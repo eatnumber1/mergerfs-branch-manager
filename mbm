@@ -1,6 +1,5 @@
 #!/bin/zsh
 env_parallel --session
-ulimit -Ss unlimited
 #setopt xtrace
 #setopt prompt_subst
 #PS4='+%N:%i:%L:$$> '
