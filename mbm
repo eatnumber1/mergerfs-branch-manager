@@ -36,7 +36,7 @@ function handle_sig {
   trap - $sig
   kill -s $sig $$
 }
-for sig (HUP TERM INT USR1) trap "handle_sig $sig" "$sig"
+for sig (HUP TERM INT) trap "handle_sig $sig" "$sig"
 
 if [[ ! -v BKT_TTL || ! $+commands[bkt] ]]; then
   echo "Install https://github.com/dimo414/bkt and set BKT_TTL for cache-rerun speedup" >&2
@@ -71,6 +71,8 @@ function process_one_drive {
   setopt err_exit err_return
   setopt warn_create_global no_unset
   setopt pipe_fail
+  # Also don't run exit handlers
+  unset zshexit_functions
 
   [[ $# -eq 1 ]] || exit 1
 
@@ -146,7 +148,6 @@ function process_one_drive {
   coproc list_files_to_move stem
   coproc_pid="$!"
   exec {coproc_fd}<&p
-
   function () {
     local PS4=''
     setopt xtrace
@@ -155,35 +156,8 @@ function process_one_drive {
         --from0 --files-from="/proc/$$/fd/${coproc_fd}" \
         -- "${all_branch_roots[@]}" "$branch_root"
   }
-
   exec {coproc_fd}<&-
   wait "$coproc_pid"
-
-  # Usage: parallel_over_files_to_move parallel/zenv_parallel args...
-  function parallel_over_files_to_move {
-    local pcmd="$1"
-    shift
-
-    local coproc_fd coproc_pid
-    coproc list_files_to_move broot stem
-    coproc_pid="$!"
-    exec {coproc_fd}<&p
-
-    local -a parallel_flags
-    # TODO remove --open-tty https://www.zsh.org/mla/users/2025/msg00219.html
-    parallel_flags+=( --open-tty )
-    parallel_flags+=( --null )
-    if (( ${#flag_dry_run} )); then
-      parallel_flags+=( --dry-run )
-    fi
-    "$pcmd" \
-      "${parallel_flags[@]}" \
-      --arg-file="/proc/$$/fd/${coproc_fd}" \
-      "$@"
-
-    exec {coproc_fd}<&-
-    wait "$coproc_pid"
-  }
 
   function check_src_dst_files_exist {
     # This function is run from zenv_parallel so doesn't inherit globally set
@@ -192,6 +166,8 @@ function process_one_drive {
     setopt err_exit err_return
     setopt warn_create_global no_unset
     setopt pipe_fail
+    # Also don't run exit handlers
+    unset zshexit_functions
 
     function check_src_dst_file_exists {
 
@@ -219,25 +195,59 @@ function process_one_drive {
       check_src_dst_file_exists "$f"
     done
   }
+
+  local -a parallel_flags
+  # TODO remove --open-tty https://www.zsh.org/mla/users/2025/msg00219.html
+  parallel_flags+=( --open-tty )
+  if (( ${#flag_dry_run} )); then
+    parallel_flags+=( --dry-run )
+  fi
+
+  coproc list_files_to_move broot stem
+  coproc_pid="$!"
+  exec {coproc_fd}<&p
   # Despite the env_parallel session, the environment is now too large, so we
   # have to pass only the necessary bits via --env.
-  parallel_over_files_to_move zenv_parallel \
+  zenv_parallel \
     --env check_src_dst_files_exist \
     --env branch_root \
+    "${parallel_flags[@]}" \
+    -X --quote --null \
+    --arg-file="/proc/$$/fd/${coproc_fd}" \
     --halt-on-error=soon,fail=1 \
-    --quote -X \
     --wd="/mnt/$drivename" \
     -- check_src_dst_files_exist
+  exec {coproc_fd}<&-
+  wait "$coproc_pid"
 
-  parallel_over_files_to_move parallel \
-    -X --quote \
+  coproc list_files_to_move broot stem
+  coproc_pid="$!"
+  exec {coproc_fd}<&p
+  parallel \
+    "${parallel_flags[@]}" \
+    -X --quote --null \
+    --arg-file="/proc/$$/fd/${coproc_fd}" \
     --halt-on-error=soon,fail=1 \
     -- env --chdir="/mnt/$drivename" rm
-  parallel_over_files_to_move parallel \
-    -X --quote \
+  exec {coproc_fd}<&-
+  wait "$coproc_pid"
+
+  coproc {
+    list_files_to_move broot stem \
+    | parallel --quote -X --null -- dirname --zero \
+    | sort --zero-terminated --unique
+  }
+  coproc_pid="$!"
+  exec {coproc_fd}<&p
+  parallel \
+    "${parallel_flags[@]}" \
+    -X --quote --null \
+    --arg-file="/proc/$$/fd/${coproc_fd}" \
     --halt-on-error=soon,fail=1 \
     -- env --chdir="/mnt/$drivename" \
-       rmdir --ignore-fail-on-non-empty --parents {//}
+       rmdir --ignore-fail-on-non-empty --parents
+  exec {coproc_fd}<&-
+  wait "$coproc_pid"
 }
 
 declare -a flag_help flag_config flag_branch flag_dry_run
@@ -348,6 +358,8 @@ function resolve_to_underlying_fs {
     setopt err_exit err_return
     setopt warn_create_global no_unset
     setopt pipe_fail
+    # Also don't run exit handlers
+    unset zshexit_functions
 
     [[ $# -eq 1 ]] || exit 1
 
