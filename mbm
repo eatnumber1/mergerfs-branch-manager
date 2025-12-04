@@ -1,0 +1,406 @@
+#!/bin/zsh
+env_parallel --session
+ulimit -Ss unlimited
+#setopt xtrace
+#setopt prompt_subst
+#PS4='+%N:%i:%L:$$> '
+setopt err_exit err_return
+setopt warn_create_global no_unset
+setopt pipe_fail
+setopt extended_glob
+
+# The above options generate warnings when env_parallel is used, so reset the
+# settings before calling it.
+function zenv_parallel {
+  emulate -LR zsh
+  #setopt xtrace
+  env_parallel "$@"
+}
+
+readonly PROGNAME="${0:t}"
+readonly PROGPATH="${0:a}"
+
+# Used by =~ operator.
+declare -a match mbegin mend
+
+zmodload -F zsh/zutil +b:zparseopts
+zmodload -F zsh/files +b:rm +b:mkdir
+
+# Set BKT_CACHE_DIR so we won't save bkt outputs to TMPDIR after we override it.
+export BKT_CACHE_DIR="${BKT_CACHE_DIR:-${BKT_TMPDIR:-${TMPDIR:-/tmp}}}"
+export TMPDIR="$(mktemp --tmpdir -d "$PROGNAME".XXXXXXX)"
+function cleanup { set -x; rm -rf -- "$TMPDIR" }
+zshexit+=( cleanup )
+() {
+  local sig
+  for sig ("$@") trap "set -x; cleanup; kill -s $1 \$\$" "$1"
+} HUP TERM INT USR1
+
+if [[ ! -v BKT_TTL || ! $+commands[bkt] ]]; then
+  echo "Install https://github.com/dimo414/bkt and set BKT_TTL for cache-rerun speedup" >&2
+  function bkt {
+    while [[ "$1" != "--" ]]; do
+      shift
+    done
+    shift
+    "$@"
+  }
+fi
+
+# Usage: disk_path_split /mnt/$disk_name/$broot/$stem...
+#
+# Sets the environment variables disk_name, broot, and stem.
+function disk_path_split {
+  local MATCH MBEGIN MEND
+  local -a match mbegin mend
+  if ! [[ "$line" =~ /mnt/([^/]+)/([^/]+)/(.+) ]]; then
+    echo "No match for \"$line\"" >&2
+    return 1
+  fi
+  disk_name="${match[1]}"
+  broot="${match[2]}"
+  stem="${match[3]}"
+}
+
+function process_one_drive {
+  # This function is run from env_parallel so doesn't inherit globally set
+  # options.
+  setopt local_options
+  setopt err_exit err_return
+  setopt warn_create_global no_unset
+  setopt pipe_fail
+
+  [[ $# -eq 1 ]] || exit 1
+
+  local filelist="$1"
+  local drivename="${1:r:t}"
+
+  local per_drive_tmpdir
+  per_drive_tmpdir="$TMPDIR/$drivename"
+  mkdir "$per_drive_tmpdir"
+
+  # Usage: list_files_to_move [disk_name] [broot] [stem]
+  function list_files_to_move {
+    local line disk_name broot stem
+    local vname
+    local -a pathparts
+    while IFS='' read -r -d '' line; do
+      disk_path_split "$line" || exit $?
+      if ([[ "$branch_root" == "$broot" ]]) continue
+      pathparts=()
+      for vname ("$@") pathparts+=( "${(P)vname}" )
+      printf '%s\0' "${(j:/:)pathparts[*]}"
+    done < "$filelist"
+  }
+
+  # Sets the array all_branch_roots
+  function get_all_branch_roots {
+    local line disk_name broot stem
+    local -a res
+    local REPLY
+    while IFS='' read -d '' line; do
+      disk_path_split "$line" || exit $?
+      if ([[ "$branch_root" == "$broot" ]]) continue
+      res+=( "$broot" )
+    done < "$filelist" >/dev/null </dev/null
+    all_branch_roots=( "${(u)res[@]}" )
+  }
+
+  local -a rsync_flags
+  # Preserve all file attributes (except --crtimes which is not supported on
+  # Linux).
+  rsync_flags+=( --archive --acls --xattrs --hard-links )
+
+  # Preserves hardlinks in the dest
+  #
+  # Note: This also means that if two files are hardlinks in the dest but not in
+  # the src, rsync will overwrite the file twice (and subsequent runs will do it
+  # again, forever, since one of the two always differ).
+  rsync_flags+=( --inplace )
+
+  # Show progress bar
+  #rsync_flags+=( --progress )
+  #rsync_flags+=( --info=progress2 )
+
+  rsync_flags+=( --whole-file )
+  rsync_flags+=( --no-compress )
+  rsync_flags+=( --sparse --specials --devices )
+  rsync_flags+=( --one-file-system )
+
+  if (( ${#flag_dry_run} )); then
+    rsync_flags+=( --dry-run )
+    rsync_flags+=( --itemize-changes )
+    rsync_flags+=( --verbose )
+  fi
+
+  local -a all_branch_roots
+  local broot
+  get_all_branch_roots
+  for broot in "${all_branch_roots[@]}"; do
+    rsync_flags+=( --link-dest=../"$broot" )
+  done
+
+  local coproc_fd coproc_pid
+  coproc list_files_to_move stem
+  coproc_pid="$!"
+  exec {coproc_fd}<&p
+
+  function () {
+    local PS4=''
+    setopt xtrace
+    env --chdir="/mnt/$drivename" \
+      rsync "${rsync_flags[@]}" \
+        --from0 --files-from="/proc/$$/fd/${coproc_fd}" \
+        -- "${all_branch_roots[@]}" "$branch_root"
+  }
+
+  exec {coproc_fd}<&-
+  wait "$coproc_pid"
+
+  # Usage: parallel_over_files_to_move parallel/zenv_parallel args...
+  function parallel_over_files_to_move {
+    local pcmd="$1"
+    shift
+
+    local coproc_fd coproc_pid
+    coproc list_files_to_move broot stem
+    coproc_pid="$!"
+    exec {coproc_fd}<&p
+
+    local -a parallel_flags
+    # TODO remove --open-tty https://www.zsh.org/mla/users/2025/msg00219.html
+    parallel_flags+=( --open-tty )
+    parallel_flags+=( --null )
+    if (( ${#flag_dry_run} )); then
+      parallel_flags+=( --dry-run )
+    fi
+    "$pcmd" \
+      "${parallel_flags[@]}" \
+      --arg-file="/proc/$$/fd/${coproc_fd}" \
+      "$@"
+
+    exec {coproc_fd}<&-
+    wait "$coproc_pid"
+  }
+
+  function check_src_dst_files_exist {
+    # This function is run from zenv_parallel so doesn't inherit globally set
+    # options.
+    setopt local_options
+    setopt err_exit err_return
+    setopt warn_create_global no_unset
+    setopt pipe_fail
+
+    function check_src_dst_file_exists {
+
+      local src_file="${1:a}"
+      local dst_file="$branch_root/${1#*/}"
+      dst_file="${dst_file:a}"
+
+      if [[ $# -ne 1 ]]; then
+        echo "args too long" >&2
+        exit 1
+      fi
+
+      if [[ ! -f "$src_file" ]]; then
+        echo "src_file $src_file does not exist" >&2
+        exit 1
+      fi
+      if [[ ! -f "$dst_file" ]]; then
+        echo "dst_file $dst_file does not exist" >&2
+        exit 1
+      fi
+    }
+
+    local f
+    for f in "$@"; do
+      check_src_dst_file_exists "$f"
+    done
+  }
+  # Despite the env_parallel session, the environment is now too large, so we
+  # have to pass only the necessary bits via --env.
+  parallel_over_files_to_move zenv_parallel \
+    --env check_src_dst_files_exist \
+    --env branch_root \
+    --halt-on-error=soon,fail=1 \
+    --quote -X \
+    --wd="/mnt/$drivename" \
+    -- check_src_dst_files_exist
+
+  parallel_over_files_to_move parallel \
+    -X --quote \
+    --halt-on-error=soon,fail=1 \
+    -- env --chdir="/mnt/$drivename" rm
+  parallel_over_files_to_move parallel \
+    -X --quote \
+    --halt-on-error=soon,fail=1 \
+    -- env --chdir="/mnt/$drivename" \
+       rmdir --ignore-fail-on-non-empty --parents {//}
+}
+
+declare -a flag_help flag_config flag_branch flag_dry_run
+# Default values.
+flag_config=( -c "${PROGPATH:A:h}"/mbm.conf )
+
+zparseopts -E -D -F -K -- \
+  {h,-help}=flag_help \
+  {c,-config}:=flag_config \
+  {b,-branch}:=flag_branch \
+  {d,-dry_run,-dry-run}=flag_dry_run
+
+source "${flag_config[2]}"
+
+function usage_and_die {
+  echo "$(<< EOF
+Usage: $PROGNAME move --branch <name> [options] /mnt/media/dirs...
+
+Args:
+/mnt/media/dirs - The directories to change the branch of.
+
+Options:
+-h, --help - Print the help message
+-b, --branch name - The branch to move the files to.
+
+Environment:
+BKT_TTL - must be set
+EOF
+  )"
+  exit "${1:-1}"
+}
+
+if [[ $# -lt 2 || "$1" != move ]]; then
+  usage_and_die 1 >&2
+fi
+shift
+
+if [[ ! -v BKT_TTL ]]; then
+  echo "BKT_TTL must be set" >&2
+  usage_and_die 1 >&2
+fi
+
+if (( ! $#flag_branch )); then
+  echo "You must specify a branch with -b/--branch" >&2
+  usage_and_die 1 >&2
+fi
+
+if [[ ! -v MERGERFS_ROOT ]]; then
+  echo "You must specify a mergerfs root in the config file" >&2
+  usage_and_die 1 >&2
+fi
+
+declare branch_name
+branch_name="${flag_branch[2]}"
+
+if (( ! $+functions[branch_${branch_name}] )); then
+  echo "No such branch \"$branch_name\"" >&2
+  usage_and_die 1 >&2
+fi
+
+branch_${branch_name}
+
+declare -a paths_to_move
+paths_to_move=( "$@" )
+
+# Usage: canonicalize_path_array array_name relative_to
+function canonicalize_path_array {
+  local ary="$1" relative_to="$2"
+
+  function canonicalize {
+    realpath \
+      --no-symlinks --canonicalize-existing \
+      --zero --relative-to="$relative_to" \
+      -- "$@"
+  }
+
+  local -a temp_ary
+  temp_ary=( ${(ps:\0:)"$(canonicalize "${(P@)ary}")"} )
+  eval "${(q)ary}=( \"\${temp_ary[@]}\" )"
+
+  unfunction canonicalize
+}
+canonicalize_path_array paths_to_move "$MERGERFS_ROOT"
+
+cd "$MERGERFS_ROOT"
+
+canonicalize_path_array branch_search_paths "$MERGERFS_ROOT"
+
+function list_all_files {
+  local -a args
+  local p
+
+  for p in "${branch_search_paths[@]}"; do
+    args+=( --search_dir "$p" )
+  done
+
+  find-with-hardlinks \
+    --print0 \
+    "${args[@]}" \
+    -- -- "${paths_to_move[@]}"
+}
+
+function resolve_to_underlying_fs {
+  function resolve_one_to_underlying_fs {
+    # This function is run from zenv_parallel so doesn't inherit globally set
+    # options.
+    setopt local_options
+    setopt err_exit err_return
+    setopt warn_create_global no_unset
+    setopt pipe_fail
+
+    [[ $# -eq 1 ]] || exit 1
+
+    declare target_path="$1"
+
+    function get_allpaths {
+      bkt --cwd -- getfattr \
+        --absolute-names --only-values --name=user.mergerfs.allpaths \
+        -- "$1"
+    }
+    declare -a allpaths
+    allpaths=( ${(ps:\0:)"$(get_allpaths "$target_path")"} )
+
+    if [[ ${#allpaths[@]} -ne 1 ]]; then
+      echo "$target_path has more than one underlying path: ${allpaths[*]}" >&2
+      exit 1
+    fi
+    local resolved_path
+    resolved_path="${allpaths[1]}"
+
+    local excluded_branch
+    for excluded_branch in "${MERGERFS_EXCLUDED_BRANCHES[@]}"; do
+      if [[ "$resolved_path" == "${excluded_branch:a}"/* ]]; then
+        return 0
+      fi
+    done
+
+    printf '%s\0' "${resolved_path}"
+  }
+
+  # TODO remove --open-tty https://www.zsh.org/mla/users/2025/msg00219.html
+  zenv_parallel \
+    --halt-on-error=soon,fail=1 \
+    --open-tty \
+    --jobs=10 --tag --lb --quote --null \
+    -- resolve_one_to_underlying_fs
+}
+
+# Groups files by drive.
+local grouped_files_dir="$TMPDIR/grouped_files"
+mkdir "$grouped_files_dir"
+
+local coproc_fd coproc_pid
+coproc { list_all_files | resolve_to_underlying_fs }
+coproc_pid="$!"
+local line disk_name broot stem
+while IFS='' read -p -r -d '' line; do
+  disk_path_split "$line" || exit $?
+  printf '%s\0' "$line" >> "${grouped_files_dir}/${disk_name}.txt"
+done
+wait "$coproc_pid"
+
+# TODO remove --open-tty https://www.zsh.org/mla/users/2025/msg00219.html
+zenv_parallel \
+  --halt-on-error=soon,fail=1 \
+  --open-tty --lb --tag --jobs=0 --quote \
+  -- process_one_drive \
+  ::: "$grouped_files_dir"/*.txt
